@@ -431,17 +431,24 @@ def _healthy_cuda(cap=(8, 6)):
 t = Ns(cuda=_healthy_cuda(), xpu=Exploding(), __version__="x")
 cfg = expect("healthy CUDA + exploding XPU: CUDA selected, not refused",
              lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "cuda")
-check("  the XPU fault is still preserved as evidence",
-      bool(cfg) and cfg["probe_report"]["xpu"][0] == AD.STATUS_EXCEPTION)
-check("  a faulty backend is NOT counted as a conflict",
+# DELETED, not softened: an earlier assertion here required the XPU fault to be "preserved as
+# evidence", which can only pass if the XPU probe RAN. It certified the eager-probing defect
+# the walk is supposed to prevent. See .planning/root-cause/accel.py.md.
+check("  the unreached XPU is reported not_probed, NOT unavailable",
+      bool(cfg) and cfg["probe_report"]["xpu"][0] == AD.STATUS_NOT_PROBED)
+check("  not_probed is a distinct status from unavailable",
+      AD.STATUS_NOT_PROBED != AD.STATUS_UNAVAILABLE)
+check("  a backend we never looked at is NOT counted as a conflict",
       bool(cfg) and cfg["conflicting_signals"] is False)
+check("  and the report says the conflict scan did not run",
+      bool(cfg) and cfg["conflict_scanned"] is False)
 
 # 2. Healthy CUDA plus malformed MPS: CUDA must succeed.
 t = Ns(cuda=_healthy_cuda(), backends=Ns(mps=Ns(is_available=lambda: "sure")), __version__="x")
 cfg = expect("healthy CUDA + malformed MPS: CUDA selected, not refused",
              lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "cuda")
-check("  the MPS fault is preserved as evidence",
-      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_MALFORMED)
+check("  the unreached MPS is reported not_probed",
+      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_NOT_PROBED)
 
 # 3. CUDA unavailable, exploding XPU, healthy MPS: refuse on the XPU fault. Falling through to
 #    MPS would silently demote the machine on the strength of a broken probe.
@@ -458,8 +465,10 @@ t = Ns(cuda=ForbiddenCuda(), xpu=Ns(is_available=lambda: True, is_bf16_supported
        backends=Ns(mps=Exploding()), __version__="x")
 cfg = expect("CUDA off + healthy XPU + exploding MPS: XPU selected",
              lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "xpu")
-check("  a lower-priority MPS fault does not invalidate the selection",
-      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_EXCEPTION)
+check("  the exploding MPS was never reached, so it reports not_probed",
+      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_NOT_PROBED)
+check("  and CUDA, which WAS probed, reports its real unavailable status",
+      bool(cfg) and cfg["probe_report"]["cuda"][0] == AD.STATUS_UNAVAILABLE)
 
 # 5. CUDA exception plus healthy XPU: refuse on the CUDA fault. A higher-priority fault must
 #    never be bypassed in favour of a lower-priority backend.
@@ -476,10 +485,16 @@ t = Ns(cuda=_healthy_cuda(cap=(8, 9)),
        xpu=Ns(is_available=lambda: True, is_bf16_supported=lambda: True),
        backends=Ns(mps=_mps(True)), __version__="x")
 cfg = AD.startup_accelerator(t, warn=False)
-check("three cleanly available: CUDA wins, conflict flagged",
-      cfg["backend"] == "cuda" and cfg["conflicting_signals"] is True)
-check("  all three listed as available", cfg["available_backends"] == ["cuda", "xpu", "mps"])
-raises("three cleanly available + strict_conflict: refuses", AD.ConflictingBackendsError,
+check("three cleanly available, LAZY: CUDA wins and the others are never probed",
+      cfg["backend"] == "cuda" and cfg["available_backends"] == ["cuda"])
+check("  conflicting_signals is False because we did not look, and conflict_scanned says so",
+      cfg["conflicting_signals"] is False and cfg["conflict_scanned"] is False)
+cfg = AD.startup_accelerator(t, strict_conflict=False, warn=False)
+check("  the others report not_probed rather than a status nobody measured",
+      cfg["probe_report"]["xpu"][0] == AD.STATUS_NOT_PROBED
+      and cfg["probe_report"]["mps"][0] == AD.STATUS_NOT_PROBED)
+raises("three cleanly available + strict_conflict (opt-in FULL SCAN): refuses",
+       AD.ConflictingBackendsError,
        lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False))
 
 # A faulty backend must not be able to manufacture a conflict refusal either.
@@ -504,9 +519,9 @@ conflict = Ns(cuda=Ns(is_available=lambda: True, get_device_capability=lambda de
               xpu=Ns(is_available=lambda: True, is_bf16_supported=lambda: True),
               __version__="x")
 cfg = AD.startup_accelerator(conflict, warn=False)
-check("conflicting signals do NOT refuse by default (precedence can choose safely)",
-      cfg["backend"] == "cuda" and cfg["conflicting_signals"] is True)
-raises("conflicting signals DO refuse under strict_conflict=True",
+check("default path does NOT refuse and does NOT scan for conflicts",
+      cfg["backend"] == "cuda" and cfg["conflict_scanned"] is False)
+raises("conflicting signals DO refuse under strict_conflict=True (opt-in full scan)",
        AD.ConflictingBackendsError,
        lambda: AD.startup_accelerator(conflict, strict_conflict=True, warn=False))
 
@@ -552,6 +567,117 @@ _att_src = io.open(os.path.join(_ROOT, "shared/attention.py"), encoding="utf-8")
 for forbidden in ("startup_accelerator", "require_backend"):
     check("shared/attention.py does NOT call %s (CPU-only imports stay GPU-free)" % forbidden,
           forbidden not in _att_src)
+
+print("\n--- 16. CALL RECORDING: laziness is a claim about SIDE EFFECTS ---")
+# Every assertion above this point inspects RETURN VALUES, and return values cannot tell
+# "we stopped" apart from "we probed everything and then filtered". An earlier implementation
+# returned the correct backend while still invoking every probe. These assertions watch the
+# invocations instead. See .planning/root-cause/accel.py.md.
+
+
+class Recorder(object):
+    """A torch fake that logs every is_available invocation by backend name."""
+
+    def __init__(self, cuda=None, xpu=None, mps=None, cap=(8, 6)):
+        self.calls = []
+        self.__version__ = "recorder"
+        self.cuda = self._mk("cuda", cuda, cap)
+        if xpu is not None:
+            self.xpu = self._mk("xpu", xpu, None)
+        if mps is not None:
+            self.backends = Ns(mps=self._mk("mps", mps, None))
+
+    def _mk(self, name, behaviour, cap):
+        calls = self.calls
+
+        def is_available():
+            calls.append(name)
+            if behaviour == "boom":
+                raise RuntimeError("driver on fire")
+            if behaviour == "junk":
+                return "sure"
+            return behaviour is True
+
+        obj = Ns(is_available=is_available)
+        if cap is not None:
+            obj.get_device_capability = lambda device=None: cap
+        if behaviour is True and name != "cuda":
+            obj.is_bf16_supported = lambda: True
+        return obj
+
+
+def _calls_for(rec, fn):
+    try:
+        fn()
+    except Exception:
+        pass
+    return list(rec.calls)
+
+
+# 1. Healthy CUDA never invokes XPU or MPS availability.
+r = Recorder(cuda=True, xpu=True, mps=True)
+seq = _calls_for(r, lambda: AD.select_backend(r))
+check("healthy CUDA: probe sequence is exactly ['cuda'] (saw %r)" % seq, seq == ["cuda"])
+check("  XPU availability never invoked", "xpu" not in seq)
+check("  MPS availability never invoked", "mps" not in seq)
+
+# The reviewer measured ['cuda','xpu','cuda','cuda','xpu'] through startup_accelerator, so
+# assert the whole entrypoint, not just the walk.
+r = Recorder(cuda=True, xpu="boom", mps=True)
+seq = _calls_for(r, lambda: AD.startup_accelerator(r, warn=False))
+check("healthy CUDA + exploding XPU through startup: xpu NEVER invoked (saw %r)" % seq,
+      "xpu" not in seq and "mps" not in seq)
+
+# 2. Unavailable CUDA then healthy XPU never invokes MPS.
+r = Recorder(cuda=False, xpu=True, mps=True)
+seq = _calls_for(r, lambda: AD.select_backend(r))
+check("CUDA off + healthy XPU: sequence is ['cuda','xpu'] (saw %r)" % seq,
+      seq == ["cuda", "xpu"])
+check("  MPS availability never invoked", "mps" not in seq)
+
+# 3. Unavailable CUDA then exploding XPU raises and never invokes MPS.
+r = Recorder(cuda=False, xpu="boom", mps=True)
+seq = _calls_for(r, lambda: AD.select_backend(r))
+check("CUDA off + exploding XPU: sequence is ['cuda','xpu'] (saw %r)" % seq,
+      seq == ["cuda", "xpu"])
+check("  MPS availability never invoked after the XPU fault", "mps" not in seq)
+raises("  and it still raises", AD.AcceleratorProbeError, lambda: AD.select_backend(r))
+
+# 4. Exploding CUDA raises and never invokes XPU or MPS.
+r = Recorder(cuda="boom", xpu=True, mps=True)
+seq = _calls_for(r, lambda: AD.select_backend(r))
+check("exploding CUDA: sequence is exactly ['cuda'] (saw %r)" % seq, seq == ["cuda"])
+check("  neither XPU nor MPS invoked", "xpu" not in seq and "mps" not in seq)
+
+# The opt-in strict scan is ALLOWED to be eager, and must be, since the question it answers is
+# about backends the walk would never reach. Asserted so the trade is explicit, not accidental.
+r = Recorder(cuda=True, xpu=True, mps=True)
+seq = _calls_for(r, lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
+check("strict_conflict DOES scan every backend, by design (saw %r)" % seq,
+      set(seq) == {"cuda", "xpu", "mps"})
+
+print("\n--- 17. NEGATIVE CONTROL: the call-order assertions can fail ---")
+# Without this, section 16 could be green against an eager implementation and nobody would
+# know. Inject the exact defect the reviewer found and require the recorder to catch it.
+_real_select = AD.select_backend
+
+
+def _eager_select(torch_mod, report=None):
+    """The previous behaviour: compute a full report first, then walk it."""
+    return _real_select(torch_mod, AD.probe_report(torch_mod) if report is None else report)
+
+
+AD.select_backend = _eager_select
+try:
+    r = Recorder(cuda=True, xpu=True, mps=True)
+    seq = _calls_for(r, lambda: AD.select_backend(r))
+    check("an eager implementation IS caught by the recorder (saw %r)" % seq,
+          seq != ["cuda"] and "xpu" in seq)
+finally:
+    AD.select_backend = _real_select
+r = Recorder(cuda=True, xpu=True, mps=True)
+seq = _calls_for(r, lambda: AD.select_backend(r))
+check("restored: lazy again after the negative control (saw %r)" % seq, seq == ["cuda"])
 
 print("\n" + "=" * 78)
 print("PASS %d   FAIL %d" % (len(PASS), len(FAIL)))

@@ -74,6 +74,18 @@ dcla_mapping:
    driver is never described as a missing one.
 4. CUDA precedence is unchanged, so a CUDA machine behaves exactly as before.
 5. `tests/test_accel.py` still contains negative controls that are observed to fire.
+6. **Selection is LAZY as a side effect, not merely in its result.** Probes for backends after
+   the selected one are never invoked. Any new code path that computes a full `probe_report()`
+   before selecting re-introduces the defect, and the returned value will look correct while
+   doing so. Section 16 records probe invocations for this reason; assertions on return values
+   cannot see it.
+7. Unexamined backends carry `not_probed`, never `unavailable`. A status nobody measured must
+   never be presentable as a measurement, and `conflict_scanned` says whether the conflict
+   question was even asked.
+8. `strict_conflict=True` is an **opt-in full scan** and is allowed to be eager, because
+   "is more than one backend available" is inherently a question about backends the walk would
+   never reach. It is off by default and lives on a separate code path so the trade is
+   deliberate rather than inherited.
 
 ## Known pre-existing defects in this tree, NOT addressed by this branch
 

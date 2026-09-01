@@ -86,9 +86,16 @@ STATUS_UNAVAILABLE = "unavailable"  # the probe ran and honestly said no
 STATUS_MALFORMED = "malformed"      # the probe returned something not recognisably boolean
 STATUS_EXCEPTION = "exception"      # the probe raised
 STATUS_AVAILABLE = "available"      # the probe ran and said yes
+STATUS_NOT_PROBED = "not_probed"    # NEVER CALLED. Not a measurement, and must not be read as
+                                    # one. A higher-priority backend already decided the
+                                    # outcome, so this probe was deliberately not invoked.
 
 # The statuses that mean the machine is broken rather than merely lacking a backend.
 FAULT_STATUSES = (STATUS_MALFORMED, STATUS_EXCEPTION)
+
+# Sentinel for "the caller did not tell us which backend was selected". Distinct from None,
+# which is a real answer meaning "there is no accelerator" and must not trigger a rescan.
+_MISSING_BACKEND = object()
 
 
 class AccelError(Exception):
@@ -185,14 +192,38 @@ def _backend_objects(torch_mod):
     )
 
 
-def probe_report(torch_mod):
-    """{backend: (status, detail)} for every backend. Never raises.
+def _backend_object(torch_mod, name):
+    if name == BACKEND_MPS:
+        return _mps_backend(torch_mod)
+    return getattr(torch_mod, name, None)
 
-    This is the diagnostic surface. `startup_accelerator` turns it into an error message that
-    names which probe failed and why.
+
+def probe_report(torch_mod):
+    """FULL SCAN. {backend: (status, detail)} for every backend. Never raises.
+
+    EAGER BY DESIGN. This invokes EVERY availability probe, including backends a precedence
+    walk would never reach. Use it for diagnostics and for the opt-in strict conflict scan. Do
+    NOT use it inside ordinary selection: a lower-priority probe that hangs, initializes
+    hardware, raises outside Exception, or faults natively would then be able to damage a
+    healthy higher-priority machine. `select_backend` walks lazily for exactly that reason.
     """
     return dict((name, _probe_detailed(obj, "is_available"))
                 for name, obj in _backend_objects(torch_mod))
+
+
+def _with_not_probed(report):
+    """Fill every unexamined backend with NOT_PROBED rather than leaving the key missing.
+
+    A caller must be able to tell "we looked and it said no" apart from "we never looked".
+    Omitting the key invites a `.get(name, default)` that quietly invents the first from the
+    second.
+    """
+    full = dict(report)
+    for name in BACKEND_PRECEDENCE:
+        if name not in full:
+            full[name] = (STATUS_NOT_PROBED,
+                          "not probed: a higher-priority backend already decided the outcome")
+    return full
 
 
 def format_probe_report(report):
@@ -220,37 +251,57 @@ def detect_backend(torch_mod):
 
 
 def select_backend(torch_mod, report=None):
-    """(backend, report), walking precedence and STOPPING at the first available backend.
+    """(backend, report), probing ONE BACKEND AT A TIME and stopping at the first available.
 
-    The walk order is the whole point. An earlier version checked every backend for faults
-    before selecting anything, which meant a healthy CUDA machine that happened to ship a
-    broken `torch.xpu` was refused startup by a backend it would never have used. A fault in
-    something we never reach is not our problem.
+    LAZY, and that is a statement about SIDE EFFECTS, not about the return value. Probes for
+    backends after the selected one are never invoked at all. An earlier version computed a
+    full `probe_report()` first and then walked it, which returned the right answer while
+    still executing every probe. That is not equivalent: a lower-priority probe can hang,
+    initialize hardware, raise something outside `Exception`, terminate the process, or fault
+    natively, and none of those are things a healthy higher-priority machine should be exposed
+    to. Ignoring a result after the fact is not the same as not asking.
 
     Per backend, in precedence order:
-      available            -> select it and STOP. Lower-priority faults are now irrelevant.
+      available            -> select it and STOP. No further probe is called.
       unavailable / absent -> keep walking. Neither is an error.
-      malformed / exception-> RAISE. This backend outranks everything still unexamined, so we
-                              cannot say whether it should have been selected. Proceeding to a
-                              lower-priority backend here would silently demote the machine on
-                              the strength of a probe that is broken, which is a worse outcome
-                              than stopping.
+      malformed / exception-> RAISE, without probing anything further. This backend outranks
+                              everything unexamined, so whether it should have been selected
+                              cannot be determined, and demoting the machine on the strength of
+                              a broken probe is worse than stopping.
 
-    The full report is returned either way, so a caller keeps every probe status as evidence
-    even when only one of them decided the outcome.
+    The returned report marks unexamined backends `not_probed`, never `unavailable`, so no
+    caller can mistake silence for a measurement.
+
+    `report` may be supplied by a caller that has already done a deliberate full scan (the
+    opt-in strict-conflict path). Passing one makes this function walk that snapshot instead of
+    probing, which is the ONLY way it becomes eager, and the caller has to ask for it.
     """
-    if report is None:
-        report = probe_report(torch_mod)
+    if report is not None:
+        walked = dict(report)
+        for name in BACKEND_PRECEDENCE:
+            status, detail = walked[name]
+            if status == STATUS_AVAILABLE:
+                return (name, walked)
+            if status in FAULT_STATUSES:
+                raise AcceleratorProbeError(name, status, detail)
+        raise NoAcceleratorError(
+            "no supported accelerator found. Probes: %s. Raised rather than falling back to "
+            "CPU, because a silent fallback makes a broken environment look like a working "
+            "one." % format_probe_report(walked))
+
+    seen = {}
     for name in BACKEND_PRECEDENCE:
-        status, detail = report[name]
+        status, detail = _probe_detailed(_backend_object(torch_mod, name), "is_available")
+        seen[name] = (status, detail)
         if status == STATUS_AVAILABLE:
-            return (name, report)
+            return (name, _with_not_probed(seen))
         if status in FAULT_STATUSES:
             raise AcceleratorProbeError(name, status, detail)
+    # Only here has every backend genuinely been probed, so the report is complete.
     raise NoAcceleratorError(
         "no supported accelerator found. Probes: %s. Raised rather than falling back to CPU, "
         "because a silent fallback makes a broken environment look like a working one."
-        % format_probe_report(report))
+        % format_probe_report(seen))
 
 
 def require_backend(torch_mod):
@@ -280,8 +331,14 @@ def cuda_capability(torch_mod, device=None):
     return _parse_capability(torch_mod.cuda.get_device_capability(device))
 
 
-def bfloat16_supported(torch_mod, default=False, warn=True):
+def bfloat16_supported(torch_mod, default=False, warn=True, backend=_MISSING_BACKEND):
     """Whether bf16 is usable, decided PER BACKEND. Never raises.
+
+    Pass `backend` when the caller has ALREADY selected one. Without it this function calls
+    `detect_backend()`, which is a full eager scan, and that silently re-probed every
+    lower-priority backend after `select_backend` had deliberately avoided them. Caught by the
+    call-recording tests, not by any assertion on return values: the answer was right and the
+    side effects were wrong.
 
     Returns a concrete bool because the call sites need one. When a backend cannot answer,
     `default` is used AND a line is printed, so the assumption is visible in the log rather
@@ -296,7 +353,8 @@ def bfloat16_supported(torch_mod, default=False, warn=True):
               error as hardcoding a CUDA capability.
       mps  -> `torch.backends.mps.is_bf16_supported()` when present, else `default`.
     """
-    backend = detect_backend(torch_mod)
+    if backend is _MISSING_BACKEND:
+        backend = detect_backend(torch_mod)
     if backend is None:
         return default
 
@@ -343,39 +401,56 @@ def startup_accelerator(torch_mod, device=None, strict_conflict=False, warn=True
     unmodified code did. The conflict is reported in the returned dict and printed. Callers
     that would rather stop than proceed on an ambiguous machine pass strict_conflict=True.
     """
-    report = probe_report(torch_mod)
-    backend, report = select_backend(torch_mod, report)
+    if strict_conflict:
+        # OPT-IN FULL SCAN. Detecting "more than one backend is available" is inherently a
+        # question about backends the precedence walk would never reach, so it CANNOT be
+        # answered lazily. Asking for it means accepting that every probe runs, including ones
+        # that may hang or fault. That is why it is off by default and why it is a separate
+        # code path rather than an extra flag threaded through the lazy walk.
+        backend, report = select_backend(torch_mod, probe_report(torch_mod))
+    else:
+        backend, report = select_backend(torch_mod)
 
     # Only backends that CLEANLY reported available count as a conflict. A backend whose probe
     # raised or returned junk is not a competing candidate, it is a broken one, and if it
     # outranked the selection we would already have raised above.
+    #
+    # Without strict_conflict the walk stopped early, so backends after the selected one are
+    # NOT_PROBED and this list is by construction just the selected backend. `conflicting` is
+    # therefore False in the lazy path: not because no conflict exists, but because we did not
+    # look, which is what `conflict_scanned` records.
     found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
     conflicting = len(found) > 1
-    if conflicting:
-        if strict_conflict:
-            raise ConflictingBackendsError(
-                "multiple accelerators cleanly reported available (%s) and strict_conflict "
-                "was requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
-        if warn:
-            print("[accel] multiple backends available (%s); selecting %r by precedence"
-                  % (", ".join(found), backend))
+    if conflicting and strict_conflict:
+        raise ConflictingBackendsError(
+            "multiple accelerators cleanly reported available (%s) and strict_conflict was "
+            "requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
+    if conflicting and warn:
+        print("[accel] multiple backends available (%s); selecting %r by precedence"
+              % (", ".join(found), backend))
 
     capability = cuda_capability(torch_mod, device) if backend == BACKEND_CUDA else None
+    # backend is passed explicitly so this does NOT re-run detect_backend(), which would scan
+    # every lower-priority backend the lazy walk just avoided.
+    bf16 = bfloat16_supported(torch_mod, warn=warn, backend=backend)
     if warn:
-        # Bounded startup line so the decision and the evidence behind it are visible in the
-        # console, rather than living only inside the returned dict. This is NOT a durable
-        # receipt; see shared/ACCEL_GOVERNANCE.md, which records capture as partial for
-        # exactly this reason.
-        print("[accel] backend=%s capability=%s bf16=%s | %s"
-              % (backend, capability,
-                 bfloat16_supported(torch_mod, warn=False), format_probe_report(report)))
+        # Bounded startup line so the decision and its evidence are visible in the console
+        # rather than living only inside the returned dict. NOT_PROBED entries print as such,
+        # so a reader can never mistake "we did not look" for "we looked and it said no".
+        # This is NOT a durable receipt; shared/ACCEL_GOVERNANCE.md records capture as partial
+        # for exactly that reason.
+        print("[accel] backend=%s capability=%s bf16=%s conflict_scanned=%s | %s"
+              % (backend, capability, bf16, strict_conflict, format_probe_report(report)))
 
     return {
         "backend": backend,
         "available_backends": found,
         "conflicting_signals": conflicting,
+        # False in the lazy path means "not looked for", not "looked for and absent". Read
+        # conflicting_signals only when this is True.
+        "conflict_scanned": bool(strict_conflict),
         "cuda_capability": capability,
-        "bfloat16_supported": bfloat16_supported(torch_mod, warn=warn),
+        "bfloat16_supported": bf16,
         "probe_report": report,
         "torch_version": getattr(torch_mod, "__version__", None),
     }

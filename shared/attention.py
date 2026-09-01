@@ -9,10 +9,26 @@ import torch.nn.functional as F
 import warnings
 from importlib.metadata import version
 
+from .accel import (
+    BACKEND_CUDA, cuda_capability as _accel_cuda_capability,
+    bfloat16_supported as _accel_bfloat16_supported, detect_backend as _accel_detect_backend)
+
 _is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
 
-major, minor = (0, 0) if _is_mps else torch.cuda.get_device_capability(None)
-bfloat16_supported =  major >= 8
+# WALL 1 of 3. This line used to read:
+#     major, minor = (0, 0) if _is_mps else torch.cuda.get_device_capability(None)
+# which asks CUDA for a capability on every non-MPS machine. On a torch build without CUDA
+# that raises AssertionError AT IMPORT, so `import wgp` fails and the render entrypoint does
+# not exist at all. See shared/accel.py for the full reasoning.
+_accel_backend = _accel_detect_backend(torch)
+_cuda_capability = None if _accel_backend != BACKEND_CUDA else _accel_cuda_capability(torch)
+
+# major/minor stay defined for backward compatibility, but they are CUDA-SCOPED and are None
+# off CUDA rather than a fabricated (0, 0). Nothing in this tree imports them from here (only
+# pay_attention and the mode helpers are imported), and a None that raises TypeError on a
+# comparison is a far better failure than a zero that silently compares as "too old".
+major, minor = _cuda_capability if _cuda_capability is not None else (None, None)
+bfloat16_supported = _accel_bfloat16_supported(torch)
 _MASKED_ATTENTION_SDPA_WARNED = False
 _MISSING = object()
 
@@ -237,7 +253,23 @@ def get_supported_attention_modes():
     if _is_mps:
         return ["sdpa", "auto"]
     ret = get_attention_modes()
-    major, minor = torch.cuda.get_device_capability()
+
+    # WALL 2 of 3. This function is called at MODULE level by wgp.py, so the bare
+    # torch.cuda.get_device_capability() that used to sit here ran during import and raised
+    # on any build without CUDA.
+    #
+    # sage, sage2, sage3 and radial are CUDA plus Triton kernels. On a non-CUDA backend they
+    # are not merely ungated, they are UNAVAILABLE, so drop them instead of asking CUDA for a
+    # capability that does not exist. sdpa remains, which is what MPS already falls back to
+    # a few lines above.
+    _cap = _accel_cuda_capability(torch) if _accel_backend == BACKEND_CUDA else None
+    if _cap is None:
+        for _mode in ("sage3", "sage2", "radial", "sage"):
+            if _mode in ret:
+                ret.remove(_mode)
+        return ret
+
+    major, minor = _cap
     if  major < 10 or not triton_installed:
         if "sage3" in ret:
             ret.remove("sage3")

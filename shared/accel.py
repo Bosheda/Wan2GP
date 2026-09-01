@@ -402,32 +402,52 @@ def startup_accelerator(torch_mod, device=None, strict_conflict=False, warn=True
     that would rather stop than proceed on an ambiguous machine pass strict_conflict=True.
     """
     if strict_conflict:
-        # OPT-IN FULL SCAN. Detecting "more than one backend is available" is inherently a
-        # question about backends the precedence walk would never reach, so it CANNOT be
-        # answered lazily. Asking for it means accepting that every probe runs, including ones
-        # that may hang or fault. That is why it is off by default and why it is a separate
-        # code path rather than an extra flag threaded through the lazy walk.
-        backend, report = select_backend(torch_mod, probe_report(torch_mod))
+        # OPT-IN FULL SCAN, with its own logic rather than a delegation to select_backend().
+        #
+        # Delegating was wrong and subtly so: select_backend() stops interpreting at the first
+        # available backend, so a scanned XPU that came back `exception` was captured in the
+        # report and then never raised, while conflict_scanned=True announced that the conflict
+        # question had been asked and answered. It had been asked and NOT answered. A backend
+        # whose status is unknown could be a second available backend, so strict mode cannot
+        # claim "no conflict" while any status is unknown.
+        #
+        # Detecting "more than one backend is available" is inherently a question about
+        # backends the precedence walk would never reach, so it cannot be answered lazily.
+        # Asking for it means accepting that every probe runs, including ones that may hang or
+        # fault. That is why it is off by default and lives on this separate path.
+        report = probe_report(torch_mod)
+
+        # 1. ANY fault anywhere invalidates the whole scan. Walked in precedence order so the
+        #    blamed backend is deterministic rather than dict-order dependent.
+        for name in BACKEND_PRECEDENCE:
+            status, detail = report[name]
+            if status in FAULT_STATUSES:
+                raise AcceleratorProbeError(name, status, detail)
+
+        # 2. Reaching here means every backend produced a clean available / unavailable /
+        #    absent, so and only so may conflict_scanned be True.
+        found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
+        if len(found) > 1:
+            raise ConflictingBackendsError(
+                "multiple accelerators cleanly reported available (%s) and strict_conflict was "
+                "requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
+        if not found:
+            raise NoAcceleratorError(
+                "no supported accelerator found. Probes: %s. Raised rather than falling back "
+                "to CPU, because a silent fallback makes a broken environment look like a "
+                "working one." % format_probe_report(report))
+        backend = found[0]
+        conflict_scanned = True
     else:
         backend, report = select_backend(torch_mod)
+        # The walk stopped early, so backends after the selected one are NOT_PROBED and this
+        # list is by construction just the selected backend. `conflicting` is therefore False
+        # here: not because no conflict exists, but because we did not look. conflict_scanned
+        # records that distinction so a reader cannot mistake one for the other.
+        found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
+        conflict_scanned = False
 
-    # Only backends that CLEANLY reported available count as a conflict. A backend whose probe
-    # raised or returned junk is not a competing candidate, it is a broken one, and if it
-    # outranked the selection we would already have raised above.
-    #
-    # Without strict_conflict the walk stopped early, so backends after the selected one are
-    # NOT_PROBED and this list is by construction just the selected backend. `conflicting` is
-    # therefore False in the lazy path: not because no conflict exists, but because we did not
-    # look, which is what `conflict_scanned` records.
-    found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
     conflicting = len(found) > 1
-    if conflicting and strict_conflict:
-        raise ConflictingBackendsError(
-            "multiple accelerators cleanly reported available (%s) and strict_conflict was "
-            "requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
-    if conflicting and warn:
-        print("[accel] multiple backends available (%s); selecting %r by precedence"
-              % (", ".join(found), backend))
 
     capability = cuda_capability(torch_mod, device) if backend == BACKEND_CUDA else None
     # backend is passed explicitly so this does NOT re-run detect_backend(), which would scan
@@ -440,15 +460,16 @@ def startup_accelerator(torch_mod, device=None, strict_conflict=False, warn=True
         # This is NOT a durable receipt; shared/ACCEL_GOVERNANCE.md records capture as partial
         # for exactly that reason.
         print("[accel] backend=%s capability=%s bf16=%s conflict_scanned=%s | %s"
-              % (backend, capability, bf16, strict_conflict, format_probe_report(report)))
+              % (backend, capability, bf16, conflict_scanned, format_probe_report(report)))
 
     return {
         "backend": backend,
         "available_backends": found,
         "conflicting_signals": conflicting,
-        # False in the lazy path means "not looked for", not "looked for and absent". Read
+        # True ONLY after a full scan in which every backend produced a clean status. False in
+        # the lazy path means "not looked for", not "looked for and absent". Read
         # conflicting_signals only when this is True.
-        "conflict_scanned": bool(strict_conflict),
+        "conflict_scanned": conflict_scanned,
         "cuda_capability": capability,
         "bfloat16_supported": bf16,
         "probe_report": report,

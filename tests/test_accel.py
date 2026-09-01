@@ -497,11 +497,21 @@ raises("three cleanly available + strict_conflict (opt-in FULL SCAN): refuses",
        AD.ConflictingBackendsError,
        lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False))
 
-# A faulty backend must not be able to manufacture a conflict refusal either.
+# A faulty backend must not manufacture a CONFLICT refusal. In the lazy path it is never even
+# probed, so it cannot.
 t = Ns(cuda=_healthy_cuda(), xpu=Exploding(), __version__="x")
-expect("strict_conflict does NOT refuse when the other backend is broken, not available",
-       lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False),
-       lambda c: c["backend"] == "cuda")
+expect("lazy path: a broken lower-priority backend cannot cause any refusal",
+       lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "cuda")
+
+# SUPERSEDED ASSERTION, replaced rather than kept. Round 3 asserted that strict mode still
+# selects CUDA here, which encoded the old behaviour where strict delegated to the early-
+# stopping walk and a scanned fault was captured but never raised. Under the corrected
+# semantics a fault ANYWHERE in a strict full scan invalidates the scan: an unknown backend
+# could be a second available one, so "no conflict" is not establishable. Strict must refuse,
+# and it must refuse with a PROBE error, not a conflict error.
+raises("strict path: the same broken backend now raises, because the scan cannot be trusted",
+       AD.AcceleratorProbeError,
+       lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False))
 
 print("\n--- 13. STARTUP ACCEPTS what it should, and stays quiet about CUDA ---")
 cfg = AD.startup_accelerator(cuda_torch(cap=(8, 6)), warn=False)
@@ -655,6 +665,94 @@ r = Recorder(cuda=True, xpu=True, mps=True)
 seq = _calls_for(r, lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
 check("strict_conflict DOES scan every backend, by design (saw %r)" % seq,
       set(seq) == {"cuda", "xpu", "mps"})
+
+print("\n--- 16b. STRICT MODE: a scanned fault invalidates the whole scan ---")
+# Strict mode used to delegate to select_backend(), which stops interpreting at the first
+# available backend. So a scanned XPU returning `exception` was captured in the report and
+# never raised, while conflict_scanned=True announced the conflict question had been asked AND
+# answered. It had been asked and not answered: an unknown backend could be a second available
+# one, so "no conflict" is not establishable while any status is unknown.
+
+# a. Non-strict, healthy CUDA + exploding XPU: succeeds WITHOUT invoking XPU.
+r = Recorder(cuda=True, xpu="boom", mps=True)
+cfg = expect("non-strict CUDA + exploding XPU: succeeds",
+             lambda: AD.startup_accelerator(r, warn=False), lambda c: c["backend"] == "cuda")
+check("  and XPU was never invoked (saw %r)" % r.calls, "xpu" not in r.calls)
+check("  conflict_scanned is False: we did not ask", bool(cfg) and cfg["conflict_scanned"] is False)
+
+# b. Strict, healthy CUDA + exploding XPU: DOES invoke XPU and DOES raise.
+r = Recorder(cuda=True, xpu="boom", mps=True)
+raises("strict CUDA + exploding XPU: raises AcceleratorProbeError", AD.AcceleratorProbeError,
+       lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
+check("  and the XPU probe WAS invoked, as strict mode requires (saw %r)" % r.calls,
+      "xpu" in r.calls)
+r2 = Recorder(cuda=True, xpu="boom", mps=True)
+try:
+    AD.startup_accelerator(r2, strict_conflict=True, warn=False)
+except AD.AcceleratorProbeError as e:
+    check("  and it blames XPU", e.backend == "xpu")
+
+# c. Strict, healthy CUDA + malformed MPS: raises.
+r = Recorder(cuda=True, xpu=False, mps="junk")
+raises("strict CUDA + malformed MPS: raises AcceleratorProbeError", AD.AcceleratorProbeError,
+       lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
+r2 = Recorder(cuda=True, xpu=False, mps="junk")
+try:
+    AD.startup_accelerator(r2, strict_conflict=True, warn=False)
+except AD.AcceleratorProbeError as e:
+    check("  and it blames MPS with the malformed status",
+          e.backend == "mps" and e.status == AD.STATUS_MALFORMED)
+
+# d. Strict, healthy CUDA + cleanly unavailable XPU and MPS: succeeds, scan is trustworthy.
+r = Recorder(cuda=True, xpu=False, mps=False)
+cfg = expect("strict CUDA + clean unavailable XPU/MPS: succeeds",
+             lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False),
+             lambda c: c["backend"] == "cuda")
+check("  conflict_scanned is True only because every status was clean",
+      bool(cfg) and cfg["conflict_scanned"] is True)
+check("  and conflicting_signals is a real negative answer, not a gap",
+      bool(cfg) and cfg["conflicting_signals"] is False)
+check("  every backend really was probed (saw %r)" % r.calls,
+      set(r.calls) == {"cuda", "xpu", "mps"})
+
+# e. Strict, multiple clean available: refuses.
+r = Recorder(cuda=True, xpu=True, mps=True)
+raises("strict, three cleanly available: raises ConflictingBackendsError",
+       AD.ConflictingBackendsError,
+       lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
+
+# f. Strict with no accelerator at all: NoAcceleratorError, not a conflict error.
+r = Recorder(cuda=False, xpu=False, mps=False)
+raises("strict, nothing available: raises NoAcceleratorError", AD.NoAcceleratorError,
+       lambda: AD.startup_accelerator(r, strict_conflict=True, warn=False))
+
+print("\n--- 16c. NEGATIVE CONTROL: conflict_scanned=True is unreachable with a dirty scan ---")
+# Exhaustive over every combination of the five real statuses across three backends. If ANY
+# result comes back with conflict_scanned=True while a scanned status was malformed or
+# exception, strict mode is lying about what it established.
+_BEHAVIOURS = {"avail": True, "unavail": False, "boom": "boom", "junk": "junk", "gone": None}
+_dirty_true = []
+_clean_true = 0
+_checked = 0
+for _c in _BEHAVIOURS:
+    for _x in _BEHAVIOURS:
+        for _m in _BEHAVIOURS:
+            _checked += 1
+            rr = Recorder(cuda=_BEHAVIOURS[_c], xpu=_BEHAVIOURS[_x], mps=_BEHAVIOURS[_m])
+            try:
+                res = AD.startup_accelerator(rr, strict_conflict=True, warn=False)
+            except Exception:
+                continue
+            statuses = [res["probe_report"][b][0] for b in AD.BACKEND_PRECEDENCE]
+            dirty = [s for s in statuses if s in AD.FAULT_STATUSES]
+            if res["conflict_scanned"] and dirty:
+                _dirty_true.append((_c, _x, _m, statuses))
+            elif res["conflict_scanned"]:
+                _clean_true += 1
+check("exhaustive %d strict combinations: conflict_scanned=True never coexists with a fault "
+      "(violations: %r)" % (_checked, _dirty_true), _dirty_true == [])
+check("  and the sweep did reach clean conflict_scanned=True cases (%d), so it is not vacuous"
+      % _clean_true, _clean_true > 0)
 
 print("\n--- 17. NEGATIVE CONTROL: the call-order assertions can fail ---")
 # Without this, section 16 could be green against an eager implementation and nobody would

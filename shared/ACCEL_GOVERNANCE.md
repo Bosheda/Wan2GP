@@ -86,6 +86,15 @@ dcla_mapping:
    "is more than one backend available" is inherently a question about backends the walk would
    never reach. It is off by default and lives on a separate code path so the trade is
    deliberate rather than inherited.
+9. **A fault anywhere in a strict scan invalidates the whole scan.** Strict mode must not
+   delegate to the early-stopping walk: doing so let a scanned `exception` be captured in the
+   report and never raised, while `conflict_scanned=True` claimed the question had been
+   answered. A backend whose status is unknown could be a second available backend, so "no
+   conflict" is not establishable while any status is unknown.
+10. **`conflict_scanned=True` is reachable only when every backend returned a clean
+    `available` / `unavailable` / `absent`.** Enforced by an exhaustive 125-combination sweep
+    in the test suite rather than by inspection, and that sweep asserts it reaches clean True
+    cases so it cannot pass by never getting there.
 
 ## Known pre-existing defects in this tree, NOT addressed by this branch
 

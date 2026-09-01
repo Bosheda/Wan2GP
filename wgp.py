@@ -67,9 +67,7 @@ from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entr
 from shared.utils.frame_scheduler import build_extension_window, build_frame_scheduler, has_slash_commands, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import get_attention_modes, get_supported_attention_modes, get_default_attention_mode
-from shared.accel import (
-    cuda_capability as _accel_cuda_capability,
-    bfloat16_supported as _accel_bfloat16_supported)
+from shared.accel import startup_accelerator as _accel_startup
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers, resize_lanczos_frames, expand_or_shrink_mask, prepare_binary_mask_frame
 from shared.utils.process_locks import (
     acquire_GPU_ressources,
@@ -2430,23 +2428,31 @@ attention_modes_supported = get_supported_attention_modes()
 args = parse_wgp_args(family_handlers, CONFIG_FILENAME, DEFAULT_LORA_ROOT)
 migrate_loras_layout()
 
-# WALL 3 of 3. This ran at module level and asked CUDA for a capability unconditionally, so
-# it raised on any build without CUDA even though the only thing it decides is bf16 support.
+# WALL 3 of 3, and the single LOUD-FAILURE point for the whole application.
+#
+# This used to be a bare torch.cuda.get_device_capability() at module level, so it raised on
+# any build without CUDA even though the only thing it decides is bf16 support.
+#
+# startup_accelerator() is the one call that is allowed to stop the program. It refuses when
+# no accelerator exists, and refuses SEPARATELY when a probe raised or returned a non-boolean,
+# so a broken driver is never reported as an absent accelerator. It is called HERE, in the
+# application entrypoint, and deliberately NOT from shared/accel.py import or from
+# shared/attention.py, so that CPU-only utilities importing a model module are not forced to
+# require a GPU.
+_accel = _accel_startup(torch, args.gpu if len(args.gpu) > 0 else None)
+_accel_backend_name = _accel["backend"]
+_gpu_capability = _accel["cuda_capability"]
+
 # gpu_major / gpu_minor are None off CUDA rather than a fabricated 0, so nothing downstream
 # can quietly compare against a made-up architecture.
-_gpu_capability = _accel_cuda_capability(torch, args.gpu if len(args.gpu) > 0 else None)
 gpu_major, gpu_minor = _gpu_capability if _gpu_capability is not None else (None, None)
-if _gpu_capability is None:
-    # Non-CUDA backend: ask that backend directly instead of inferring from a CUDA
-    # architecture number that does not exist for it.
-    bfloat16_supported = _accel_bfloat16_supported(torch)
-    if not bfloat16_supported:
-        print("Switching to FP16 models when possible as this accelerator does not report BF16 support")
-elif gpu_major < 8:
-    print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
-    bfloat16_supported = False
-else:
-    bfloat16_supported = True
+bfloat16_supported = _accel["bfloat16_supported"]
+if not bfloat16_supported:
+    if _gpu_capability is None:
+        print("Switching to FP16 models when possible as the %s backend does not report BF16 support"
+              % _accel_backend_name)
+    else:
+        print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
 
 args.flow_reverse = True
 processing_device = args.gpu

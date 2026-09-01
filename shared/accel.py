@@ -7,7 +7,7 @@ enabled` on a torch build without CUDA. Three sites call it while a module is be
 so on an XPU-only build `import wgp` fails outright and the render entrypoint does not exist:
 
   shared/attention.py:14   module level
-  shared/attention.py:240  inside get_supported_attention_modes(), which wgp.py:2426 calls at
+  shared/attention.py:240  inside get_supported_attention_modes(), which wgp.py calls at
                            module level
   wgp.py:2430              module level
 
@@ -20,19 +20,40 @@ WHAT THIS DELIBERATELY IS NOT
 It is NOT a `torch.cuda` shim. `shared/mps/device_patch.py` solves the same problem by
 monkeypatching `torch.cuda.get_device_capability` to return an invented `(11, 0)`. That is
 less invasive but it makes `torch.cuda` lie: every later caller believes CUDA is present with
-a capability that no hardware reports. Downstream code then selects CUDA-only kernels on a
-device that cannot run them, and the failure surfaces far from its cause. This module reports
-the truth instead and lets callers branch on it.
+a capability no hardware reports, downstream code selects CUDA-only kernels on a device that
+cannot run them, and the failure surfaces far from its cause. This module reports the truth
+and lets callers branch on it.
+
+TWO LAYERS, AND WHY THEY ARE SEPARATE
+=====================================
+DISCOVERY answers "which backend, if any" and never raises: `detect_backend`,
+`available_backends`, `cuda_capability`, `bfloat16_supported`. Import-time code paths and
+CPU-only utilities use this layer, which is why importing this module never requires an
+accelerator and never fails.
+
+STARTUP answers "is this machine fit to run" and DOES raise: `startup_accelerator`. An
+application entrypoint calls it once. It is the loud failure. Keeping it out of the discovery
+layer is deliberate: a CPU-only utility that happens to import a model module must not be
+made to require a GPU.
+
+WHY DISCOVERY COLLAPSES AND STARTUP DOES NOT
+============================================
+`_probe` maps a missing attribute, a raising probe and a malformed return all to None,
+because for SELECTION they mean the same thing: not a backend we can safely choose. But that
+collapse is unacceptable for DIAGNOSIS. "driver on fire" must never be reported as "no
+accelerator found". `probe_report` therefore preserves the distinction as an explicit status
+per backend, and `startup_accelerator` raises an error naming the backend, the status and the
+underlying detail.
 
 RULES
 =====
 1. CUDA branch may query CUDA compute capability.
-2. Non-CUDA backends never call `torch.cuda` beyond the availability probe described below.
+2. Non-CUDA backends never call `torch.cuda` beyond the availability probe below.
 3. No backend fabricates a CUDA capability. `cuda_capability()` returns None when the
    question does not apply, because `(0, 0)` and `(11, 0)` are both lies that a later
    `major >= 8` will act on without complaint.
-4. Absence of any accelerator is available as a loud failure via `require_backend()`.
-5. Backend identity is separate from CUDA capability. They are different questions.
+4. Absence of any accelerator fails loudly at startup.
+5. Backend identity is separate from CUDA capability. Different questions.
 6. Feature support is decided per backend, never by reusing `major >= 8`, which is a CUDA
    notion and meaningless on an Arc or an M-series part.
 7. Existing CUDA behaviour is preserved. CUDA is probed first, and on a CUDA machine every
@@ -49,8 +70,7 @@ STRICT PROBE VALUES
 ===================
 `_strict_bool` accepts only a real bool or the ints 0 and 1. It does NOT use `bool(value)`.
 `bool("false")` is True in Python, so coercing a probe's return would turn a malformed answer
-into a confident yes. A value that is not recognisably boolean is treated as UNKNOWN, and
-unknown never silently becomes available.
+into a confident yes.
 """
 
 BACKEND_CUDA = "cuda"
@@ -60,13 +80,45 @@ BACKEND_MPS = "mps"
 # CUDA first. That ordering is what preserves existing behaviour on a CUDA machine.
 BACKEND_PRECEDENCE = (BACKEND_CUDA, BACKEND_XPU, BACKEND_MPS)
 
+# Probe outcomes, kept distinct for diagnosis. Only AVAILABLE means selectable.
+STATUS_ABSENT = "absent"            # the submodule or the probe attribute is not there
+STATUS_UNAVAILABLE = "unavailable"  # the probe ran and honestly said no
+STATUS_MALFORMED = "malformed"      # the probe returned something not recognisably boolean
+STATUS_EXCEPTION = "exception"      # the probe raised
+STATUS_AVAILABLE = "available"      # the probe ran and said yes
+
+# The statuses that mean the machine is broken rather than merely lacking a backend.
+FAULT_STATUSES = (STATUS_MALFORMED, STATUS_EXCEPTION)
+
 
 class AccelError(Exception):
     """Base class so a caller can catch everything from this module at once."""
 
 
 class NoAcceleratorError(AccelError):
-    """No supported accelerator is present."""
+    """No supported accelerator is present. Raised only from the startup layer."""
+
+
+class AcceleratorProbeError(AccelError):
+    """A backend probe misbehaved: it raised, or returned a non-boolean.
+
+    Distinct from NoAcceleratorError on purpose. A machine whose XPU probe throws is NOT the
+    same as a machine with no accelerator, and reporting the second when the first is true
+    sends whoever reads the log looking in the wrong place.
+    """
+
+    def __init__(self, backend, status, detail):
+        self.backend = backend
+        self.status = status
+        self.detail = detail
+        super(AcceleratorProbeError, self).__init__(
+            "accelerator probe for %r reported %s: %s. This is a probe fault, not an absent "
+            "accelerator. Fix the driver or the torch install rather than assuming CPU."
+            % (backend, status, detail))
+
+
+class ConflictingBackendsError(AccelError):
+    """More than one backend reported present and strict conflict handling was requested."""
 
 
 class MalformedCapabilityError(AccelError):
@@ -89,27 +141,62 @@ def _strict_bool(value):
     return None
 
 
-def _probe(obj, name):
-    """Call `obj.name()` and return a strict tri-state.
-
-    None covers every ambiguous case at once: the attribute is missing, the call raised, or
-    the return value is not recognisably boolean. A backend we cannot get a clean yes from is
-    not a backend we should select.
-    """
+def _probe_detailed(obj, name):
+    """(status, detail) for one probe. This is the layer that does NOT collapse."""
     if obj is None:
-        return None
+        return (STATUS_ABSENT, "submodule not present")
     fn = getattr(obj, name, None)
     if fn is None:
-        return None
+        return (STATUS_ABSENT, "%s() not present" % name)
     try:
-        return _strict_bool(fn())
-    except Exception:
-        return None
+        raw = fn()
+    except Exception as exc:
+        return (STATUS_EXCEPTION, "%s: %s" % (type(exc).__name__, exc))
+    strict = _strict_bool(raw)
+    if strict is None:
+        return (STATUS_MALFORMED, "%s() returned %r, which is not a bool" % (name, raw))
+    return (STATUS_AVAILABLE if strict else STATUS_UNAVAILABLE, "%s() returned %r" % (name, raw))
+
+
+def _probe(obj, name):
+    """Tri-state for SELECTION. Collapses every ambiguous case to None on purpose.
+
+    A backend we cannot get a clean yes from is not a backend we should select. Diagnosis
+    uses `_probe_detailed`; this is the discovery layer and it never raises.
+    """
+    status, _ = _probe_detailed(obj, name)
+    if status == STATUS_AVAILABLE:
+        return True
+    if status == STATUS_UNAVAILABLE:
+        return False
+    return None
 
 
 def _mps_backend(torch_mod):
     """MPS lives at `torch.backends.mps`, not `torch.mps`, so it needs its own accessor."""
     return getattr(getattr(torch_mod, "backends", None), "mps", None)
+
+
+def _backend_objects(torch_mod):
+    return (
+        (BACKEND_CUDA, getattr(torch_mod, "cuda", None)),
+        (BACKEND_XPU, getattr(torch_mod, "xpu", None)),
+        (BACKEND_MPS, _mps_backend(torch_mod)),
+    )
+
+
+def probe_report(torch_mod):
+    """{backend: (status, detail)} for every backend. Never raises.
+
+    This is the diagnostic surface. `startup_accelerator` turns it into an error message that
+    names which probe failed and why.
+    """
+    return dict((name, _probe_detailed(obj, "is_available"))
+                for name, obj in _backend_objects(torch_mod))
+
+
+def format_probe_report(report):
+    return "; ".join("%s=%s (%s)" % (b, report[b][0], report[b][1]) for b in BACKEND_PRECEDENCE)
 
 
 def available_backends(torch_mod):
@@ -118,35 +205,38 @@ def available_backends(torch_mod):
     A list rather than one value, so CONFLICTING SIGNALS stay visible instead of being
     silently collapsed.
     """
-    found = []
-    if _probe(getattr(torch_mod, "cuda", None), "is_available") is True:
-        found.append(BACKEND_CUDA)
-    if _probe(getattr(torch_mod, "xpu", None), "is_available") is True:
-        found.append(BACKEND_XPU)
-    if _probe(_mps_backend(torch_mod), "is_available") is True:
-        found.append(BACKEND_MPS)
-    return found
+    return [name for name, obj in _backend_objects(torch_mod)
+            if _probe(obj, "is_available") is True]
 
 
 def detect_backend(torch_mod):
-    """The backend to use, or None when there is no accelerator.
+    """The backend to use, or None when there is no accelerator. Never raises.
 
     Returns None rather than raising: "is there an accelerator" is a fair question with a fair
-    negative answer. Callers that cannot proceed without one should use `require_backend`.
+    negative answer, and import-time code needs to ask it without risk.
     """
     found = available_backends(torch_mod)
     return found[0] if found else None
 
 
 def require_backend(torch_mod):
-    """The backend to use, raising `NoAcceleratorError` when there is none."""
-    backend = detect_backend(torch_mod)
-    if backend is None:
+    """The backend to use, raising when there is none or when a probe misbehaved.
+
+    Probe faults are checked FIRST, so a throwing or malformed probe is never reported as an
+    absent accelerator.
+    """
+    report = probe_report(torch_mod)
+    for name in BACKEND_PRECEDENCE:
+        status, detail = report[name]
+        if status in FAULT_STATUSES:
+            raise AcceleratorProbeError(name, status, detail)
+    found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
+    if not found:
         raise NoAcceleratorError(
-            "no supported accelerator found (checked cuda, xpu, mps). Raised rather than "
-            "falling back to CPU, because a silent fallback makes a broken environment look "
-            "like a working one.")
-    return backend
+            "no supported accelerator found. Probes: %s. Raised rather than falling back to "
+            "CPU, because a silent fallback makes a broken environment look like a working "
+            "one." % format_probe_report(report))
+    return found[0]
 
 
 def _parse_capability(raw):
@@ -172,16 +262,16 @@ def cuda_capability(torch_mod, device=None):
 
 
 def bfloat16_supported(torch_mod, default=False, warn=True):
-    """Whether bf16 is usable, decided PER BACKEND.
+    """Whether bf16 is usable, decided PER BACKEND. Never raises.
 
     Returns a concrete bool because the call sites need one. When a backend cannot answer,
-    `default` is used AND a line is printed, so an assumption is visible in the log rather
-    than buried. The default is False on purpose: fp16 runs everywhere, so guessing wrong in
-    that direction costs quality, while guessing True on a device without bf16 kernels costs
-    a crash or silent garbage.
+    `default` is used AND a line is printed, so the assumption is visible in the log rather
+    than buried. The default is False on purpose: fp16 runs everywhere, so guessing wrong that
+    way costs quality, while guessing True on a device without bf16 kernels costs a crash or
+    silent garbage.
 
-      cuda -> `torch.cuda.is_bf16_supported()` when present, else the `major >= 8` rule. That
-              rule is what the unmodified code used and is preserved deliberately.
+      cuda -> `torch.cuda.is_bf16_supported()` when present, else the `major >= 8` rule, which
+              is what the unmodified code used and is preserved deliberately.
       xpu  -> `torch.xpu.is_bf16_supported()` when present, else `default`. NOT inferred from
               the device name: hardcoding "Arc supports bf16" here would be the same class of
               error as hardcoding a CUDA capability.
@@ -211,14 +301,57 @@ def bfloat16_supported(torch_mod, default=False, warn=True):
         probed = _probe(_mps_backend(torch_mod), "is_bf16_supported")
     if probed is None:
         if warn:
-            print("[accel] %s exposes no is_bf16_supported(); assuming bf16=%s. Set it "
+            print("[accel] %s exposes no usable is_bf16_supported(); assuming bf16=%s. Set it "
                   "explicitly if this is wrong." % (backend, default))
         return default
     return probed
 
 
+def startup_accelerator(torch_mod, device=None, strict_conflict=False, warn=True):
+    """THE LOUD FAILURE. Call once from an application entrypoint, never at library import.
+
+    Returns a dict describing the selected backend, its CUDA capability (None off CUDA) and
+    bf16 support.
+
+    Raises:
+      AcceleratorProbeError    a probe raised or returned a non-boolean. Checked FIRST so a
+                               broken driver is never reported as an absent accelerator.
+      NoAcceleratorError       every probe honestly said no.
+      ConflictingBackendsError more than one backend present AND strict_conflict=True.
+
+    On conflicting signals with strict_conflict=False (the default) selection is NOT refused,
+    because the precedence rule can still choose safely: CUDA first, which is exactly what the
+    unmodified code did. The conflict is reported in the returned dict and printed. Callers
+    that would rather stop than proceed on an ambiguous machine pass strict_conflict=True.
+    """
+    report = probe_report(torch_mod)
+    backend = require_backend(torch_mod)  # raises on fault or absence, in that order
+
+    found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
+    conflicting = len(found) > 1
+    if conflicting:
+        if strict_conflict:
+            raise ConflictingBackendsError(
+                "multiple accelerators reported present (%s) and strict_conflict was "
+                "requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
+        if warn:
+            print("[accel] multiple backends present (%s); selecting %r by precedence"
+                  % (", ".join(found), backend))
+
+    capability = cuda_capability(torch_mod, device) if backend == BACKEND_CUDA else None
+    return {
+        "backend": backend,
+        "available_backends": found,
+        "conflicting_signals": conflicting,
+        "cuda_capability": capability,
+        "bfloat16_supported": bfloat16_supported(torch_mod, warn=warn),
+        "probe_report": report,
+        "torch_version": getattr(torch_mod, "__version__", None),
+    }
+
+
 def describe(torch_mod):
-    """Every answer in one dict, for logging and receipts.
+    """Every answer in one dict, for logging and receipts. Never raises.
 
     `cuda_capability` is None on non-CUDA backends. That None is meaningful and must reach a
     receipt as UNKNOWN or NOT-APPLICABLE, never as a defaulted number.
@@ -234,5 +367,6 @@ def describe(torch_mod):
         "conflicting_signals": len(found) > 1,
         "cuda_capability": cap,
         "bfloat16_supported": bfloat16_supported(torch_mod, warn=False),
+        "probe_report": probe_report(torch_mod),
         "torch_version": getattr(torch_mod, "__version__", None),
     }

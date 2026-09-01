@@ -349,11 +349,7 @@ __all__ = [
     'get_current_cuda_architecture',
     'resolve_attention_mode',
     'pay_attention',
-    # PRE-EXISTING UPSTREAM DEFECT, unrelated to the accelerator work in this branch.
-    # __all__ listed a bare 'attention', which is not defined anywhere in this module (AST
-    # confirmed against pristine c2d7c3e7). `from shared.attention import *` raises
-    # AttributeError on it today. Removed rather than left dangling. Revert this hunk alone
-    # if upstream would rather keep it.
+    'attention',
 ]
 
 def get_cu_seqlens(batch_size, lens, max_len):

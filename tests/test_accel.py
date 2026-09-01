@@ -10,11 +10,21 @@ TWO PARTS
 =========
 PART A exercises shared/accel.py directly.
 
-PART B is a STRUCTURAL proof over the patched files. Part A can only show that the helper
+PART B is a STRUCTURAL check over the patched files. Part A can only show that the helper
 behaves; it cannot show that the call sites actually use it. Part B parses shared/attention.py
-and wgp.py with ast and asserts that no `torch.cuda.<anything>` call is reachable during
-import except the permitted availability probe. That is the property that decides whether
-`import wgp` works on a machine without CUDA, and it is the property Part A cannot see.
+and wgp.py with ast and asserts that the three identified import-time CUDA capability
+accesses are gone.
+
+WHAT PART B DOES NOT ESTABLISH, stated because the distinction matters
+=====================================================================
+It clears THE THREE IDENTIFIED WALLS. It does NOT construct the complete import-time call
+graph, so it cannot prove that no forbidden CUDA access is transitively reachable anywhere
+during `import wgp`. A module imported four levels down could still hold one. Whether the
+real `import wgp` succeeds on Intel XPU hardware is Phase 2 acceptance under a healthy GPU
+lease and is NOT claimed here.
+
+PART C covers the startup gate: the one place allowed to stop the program, and the refusals
+it must produce.
 
 THE CENTRAL BEHAVIOURAL PROOF
 =============================
@@ -290,7 +300,8 @@ for rel in ("shared/attention.py", "wgp.py"):
         for attr, lineno in _cuda_attr_calls(stmt):
             if attr not in PERMITTED:
                 offenders.append("%s:%d torch.cuda.%s" % (rel, lineno, attr))
-    check("%s: no forbidden torch.cuda attribute at module level (found %r)"
+    check("%s: no DIRECT forbidden torch.cuda attribute at module level (found %r). This "
+          "clears the identified walls only; it is not a transitive import-graph proof."
           % (rel, offenders), offenders == [])
 
 # get_supported_attention_modes is called at module level BY wgp.py, so its body counts as
@@ -311,6 +322,132 @@ _seen = [a for stmt in _module_level_nodes(_probe_tree) for a, _ in _cuda_attr_c
          if a not in PERMITTED]
 check("Part B scanner detects a deliberately planted offender (saw %r)" % _seen,
       _seen == ["get_device_capability"])
+
+# =======================================================================================
+# PART C: the startup gate
+# =======================================================================================
+print("\n--- 11. PROBE STATUS is diagnosable, not collapsed ---")
+rep = AD.probe_report(bare_torch())
+check("absent xpu reports 'absent'", rep["xpu"][0] == AD.STATUS_ABSENT)
+check("cuda that honestly says no reports 'unavailable'",
+      rep["cuda"][0] == AD.STATUS_UNAVAILABLE)
+
+rep = AD.probe_report(Ns(cuda=ForbiddenCuda(), xpu=Exploding()))
+check("a raising probe reports 'exception', NOT absent",
+      rep["xpu"][0] == AD.STATUS_EXCEPTION)
+check("the exception detail names the real error",
+      "driver on fire" in rep["xpu"][1] and "RuntimeError" in rep["xpu"][1])
+
+rep = AD.probe_report(Ns(cuda=ForbiddenCuda(), xpu=Ns(is_available=lambda: "yes")))
+check("a non-boolean probe reports 'malformed', NOT absent",
+      rep["xpu"][0] == AD.STATUS_MALFORMED)
+check("the malformed detail shows the offending value", "'yes'" in rep["xpu"][1])
+
+check("available reports 'available'",
+      AD.probe_report(xpu_torch(bf16=True))["xpu"][0] == AD.STATUS_AVAILABLE)
+check("all five statuses are distinct",
+      len({AD.STATUS_ABSENT, AD.STATUS_UNAVAILABLE, AD.STATUS_MALFORMED,
+           AD.STATUS_EXCEPTION, AD.STATUS_AVAILABLE}) == 5)
+
+print("\n--- 12. STARTUP REFUSES: the loud failure the reviewer required ---")
+raises("no accelerator: startup raises NoAcceleratorError", AD.NoAcceleratorError,
+       lambda: AD.startup_accelerator(bare_torch()))
+
+t = Ns(cuda=ForbiddenCuda(), xpu=Exploding(), __version__="x")
+raises("exploding xpu probe: startup raises AcceleratorProbeError", AD.AcceleratorProbeError,
+       lambda: AD.startup_accelerator(t))
+try:
+    AD.startup_accelerator(t)
+except AD.AcceleratorProbeError as e:
+    check("the error names WHICH probe failed", e.backend == "xpu")
+    check("the error carries the status", e.status == AD.STATUS_EXCEPTION)
+    check("'driver on fire' is NOT reported as 'no accelerator found'",
+          "driver on fire" in str(e) and "no supported accelerator" not in str(e))
+
+t = Ns(cuda=ForbiddenCuda(), xpu=Ns(is_available=lambda: "yes"), __version__="x")
+raises("malformed xpu availability: startup raises AcceleratorProbeError",
+       AD.AcceleratorProbeError, lambda: AD.startup_accelerator(t))
+try:
+    AD.startup_accelerator(t)
+except AD.AcceleratorProbeError as e:
+    check("malformed error names the probe and status",
+          e.backend == "xpu" and e.status == AD.STATUS_MALFORMED)
+
+# A fault must win over absence. Without ordering, a machine whose only accelerator probe
+# throws would be reported as having none, sending the reader to the wrong problem.
+t = Ns(cuda=ForbiddenCuda(), xpu=Exploding(), backends=Ns(mps=Ns(is_available=lambda: False)))
+try:
+    AD.startup_accelerator(t)
+    check("fault beats absence in reporting order", False)
+except AD.AcceleratorProbeError:
+    check("fault beats absence in reporting order", True)
+except AD.NoAcceleratorError:
+    check("fault beats absence in reporting order (got NoAcceleratorError instead)", False)
+
+print("\n--- 13. STARTUP ACCEPTS what it should, and stays quiet about CUDA ---")
+cfg = AD.startup_accelerator(cuda_torch(cap=(8, 6)), warn=False)
+check("cuda startup selects cuda", cfg["backend"] == "cuda")
+check("cuda startup reports the real capability", cfg["cuda_capability"] == (8, 6))
+check("cuda startup bf16 matches legacy major>=8", cfg["bfloat16_supported"] is True)
+check("cuda startup carries the probe report", "cuda" in cfg["probe_report"])
+
+cfg = AD.startup_accelerator(xpu_torch(bf16=True), warn=False)
+check("xpu startup selects xpu", cfg["backend"] == "xpu")
+check("xpu startup capability is None, not fabricated", cfg["cuda_capability"] is None)
+check("xpu startup bf16 from the xpu probe", cfg["bfloat16_supported"] is True)
+
+conflict = Ns(cuda=Ns(is_available=lambda: True, get_device_capability=lambda device=None: (8, 9)),
+              xpu=Ns(is_available=lambda: True, is_bf16_supported=lambda: True),
+              __version__="x")
+cfg = AD.startup_accelerator(conflict, warn=False)
+check("conflicting signals do NOT refuse by default (precedence can choose safely)",
+      cfg["backend"] == "cuda" and cfg["conflicting_signals"] is True)
+raises("conflicting signals DO refuse under strict_conflict=True",
+       AD.ConflictingBackendsError,
+       lambda: AD.startup_accelerator(conflict, strict_conflict=True, warn=False))
+
+print("\n--- 14. NEGATIVE CONTROL: the startup refusal is observed to fire ---")
+# Without this, sections 12 and 13 could both pass on a gate that never actually refuses.
+_fired = {"no_accel": False, "probe": False, "conflict": False}
+try:
+    AD.startup_accelerator(bare_torch())
+except AD.NoAcceleratorError:
+    _fired["no_accel"] = True
+try:
+    AD.startup_accelerator(Ns(cuda=ForbiddenCuda(), xpu=Exploding()))
+except AD.AcceleratorProbeError:
+    _fired["probe"] = True
+try:
+    AD.startup_accelerator(conflict, strict_conflict=True, warn=False)
+except AD.ConflictingBackendsError:
+    _fired["conflict"] = True
+check("all three refusal branches were observed firing: %r" % _fired, all(_fired.values()))
+check("and the gate does NOT refuse a healthy machine",
+      AD.startup_accelerator(cuda_torch(), warn=False)["backend"] == "cuda")
+
+print("\n--- 15. STRUCTURAL: the loud failure is actually WIRED IN ---")
+# Blocker 1 was that require_backend existed but no site called it. Assert the wiring, not
+# the intention, because an uncalled gate is exactly what shipped last time.
+_wgp = io.open(os.path.join(_ROOT, "wgp.py"), encoding="utf-8").read()
+_wgp_tree = ast.parse(_wgp)
+_imported = set()
+for node in ast.walk(_wgp_tree):
+    if isinstance(node, ast.ImportFrom) and node.module == "shared.accel":
+        for a in node.names:
+            _imported.add(a.asname or a.name)
+check("wgp.py imports the startup gate from shared.accel",
+      any(n in _imported for n in ("_accel_startup", "startup_accelerator")))
+_called = [n for n in ast.walk(_wgp_tree)
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+           and n.func.id in ("_accel_startup", "startup_accelerator")]
+check("wgp.py actually CALLS it (%d call site(s))" % len(_called), len(_called) >= 1)
+
+# And the discovery layer must stay non-raising: attention.py must NOT call the startup gate,
+# or every CPU-only utility importing a model module would suddenly require a GPU.
+_att_src = io.open(os.path.join(_ROOT, "shared/attention.py"), encoding="utf-8").read()
+for forbidden in ("startup_accelerator", "require_backend"):
+    check("shared/attention.py does NOT call %s (CPU-only imports stay GPU-free)" % forbidden,
+          forbidden not in _att_src)
 
 print("\n" + "=" * 78)
 print("PASS %d   FAIL %d" % (len(PASS), len(FAIL)))

@@ -35,9 +35,20 @@ dcla_mapping:
     detection: yes
       # probe_report() classifies every backend as absent / unavailable / malformed /
       # exception / available. Faults are distinguishable from absence.
-    capture: yes
-      # startup_accelerator() returns probe_report in its result, so the machine's answer is
-      # recorded in the caller's log rather than reduced to a single bool.
+    capture: partial
+      # startup_accelerator() returns probe_report in its result AND emits one bounded console
+      # line naming the selected backend, its capability, bf16, and every probe status. That
+      # makes the decision and its evidence visible at startup.
+      #
+      # It is NOT durable capture, and this was previously overclaimed here. Returning a dict
+      # is not recording: wgp.py holds `_accel` in memory and writes nothing. Nothing survives
+      # process exit, so a later question of the form "which backend did the run on the 31st
+      # actually select, and what did the probes say" cannot be answered from an artifact.
+      #
+      # MISSING ARTIFACT, named so it is not hand-waved: a startup receipt written to disk
+      # (backend, capability, bf16, per-backend probe status, torch version, timestamp) that a
+      # reviewer can read after the fact. Not added here because writing files is outside this
+      # branch's scope and the path would need to be an operator decision.
     learning: partial
       # The bf16 default for a backend that exposes no probe is a documented conservative
       # assumption, printed when used. It is not learned from history, and it should not be

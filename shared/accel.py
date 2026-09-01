@@ -219,24 +219,43 @@ def detect_backend(torch_mod):
     return found[0] if found else None
 
 
-def require_backend(torch_mod):
-    """The backend to use, raising when there is none or when a probe misbehaved.
+def select_backend(torch_mod, report=None):
+    """(backend, report), walking precedence and STOPPING at the first available backend.
 
-    Probe faults are checked FIRST, so a throwing or malformed probe is never reported as an
-    absent accelerator.
+    The walk order is the whole point. An earlier version checked every backend for faults
+    before selecting anything, which meant a healthy CUDA machine that happened to ship a
+    broken `torch.xpu` was refused startup by a backend it would never have used. A fault in
+    something we never reach is not our problem.
+
+    Per backend, in precedence order:
+      available            -> select it and STOP. Lower-priority faults are now irrelevant.
+      unavailable / absent -> keep walking. Neither is an error.
+      malformed / exception-> RAISE. This backend outranks everything still unexamined, so we
+                              cannot say whether it should have been selected. Proceeding to a
+                              lower-priority backend here would silently demote the machine on
+                              the strength of a probe that is broken, which is a worse outcome
+                              than stopping.
+
+    The full report is returned either way, so a caller keeps every probe status as evidence
+    even when only one of them decided the outcome.
     """
-    report = probe_report(torch_mod)
+    if report is None:
+        report = probe_report(torch_mod)
     for name in BACKEND_PRECEDENCE:
         status, detail = report[name]
+        if status == STATUS_AVAILABLE:
+            return (name, report)
         if status in FAULT_STATUSES:
             raise AcceleratorProbeError(name, status, detail)
-    found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
-    if not found:
-        raise NoAcceleratorError(
-            "no supported accelerator found. Probes: %s. Raised rather than falling back to "
-            "CPU, because a silent fallback makes a broken environment look like a working "
-            "one." % format_probe_report(report))
-    return found[0]
+    raise NoAcceleratorError(
+        "no supported accelerator found. Probes: %s. Raised rather than falling back to CPU, "
+        "because a silent fallback makes a broken environment look like a working one."
+        % format_probe_report(report))
+
+
+def require_backend(torch_mod):
+    """The backend to use, raising when there is none or when a probe that outranks it broke."""
+    return select_backend(torch_mod)[0]
 
 
 def _parse_capability(raw):
@@ -325,20 +344,32 @@ def startup_accelerator(torch_mod, device=None, strict_conflict=False, warn=True
     that would rather stop than proceed on an ambiguous machine pass strict_conflict=True.
     """
     report = probe_report(torch_mod)
-    backend = require_backend(torch_mod)  # raises on fault or absence, in that order
+    backend, report = select_backend(torch_mod, report)
 
+    # Only backends that CLEANLY reported available count as a conflict. A backend whose probe
+    # raised or returned junk is not a competing candidate, it is a broken one, and if it
+    # outranked the selection we would already have raised above.
     found = [n for n in BACKEND_PRECEDENCE if report[n][0] == STATUS_AVAILABLE]
     conflicting = len(found) > 1
     if conflicting:
         if strict_conflict:
             raise ConflictingBackendsError(
-                "multiple accelerators reported present (%s) and strict_conflict was "
-                "requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
+                "multiple accelerators cleanly reported available (%s) and strict_conflict "
+                "was requested. Probes: %s" % (", ".join(found), format_probe_report(report)))
         if warn:
-            print("[accel] multiple backends present (%s); selecting %r by precedence"
+            print("[accel] multiple backends available (%s); selecting %r by precedence"
                   % (", ".join(found), backend))
 
     capability = cuda_capability(torch_mod, device) if backend == BACKEND_CUDA else None
+    if warn:
+        # Bounded startup line so the decision and the evidence behind it are visible in the
+        # console, rather than living only inside the returned dict. This is NOT a durable
+        # receipt; see shared/ACCEL_GOVERNANCE.md, which records capture as partial for
+        # exactly this reason.
+        print("[accel] backend=%s capability=%s bf16=%s | %s"
+              % (backend, capability,
+                 bfloat16_supported(torch_mod, warn=False), format_probe_report(report)))
+
     return {
         "backend": backend,
         "available_backends": found,

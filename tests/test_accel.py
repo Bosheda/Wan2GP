@@ -57,6 +57,24 @@ def check(label, cond):
     print("%s  %s" % ("PASS" if cond else "FAIL", label))
 
 
+def expect(label, fn, pred):
+    """Run fn() and check pred(result), turning an UNEXPECTED exception into a FAIL.
+
+    Without this, one unexpected raise aborts the process and every later section silently
+    disappears. Measured on 2026-08-31: against the previous selection algorithm this suite
+    died on the first case of section 12b after 98 passes, so the number of requirement
+    violations could not be counted at all. A harness that stops at the first surprise reports
+    "no failures" for everything it never reached.
+    """
+    try:
+        result = fn()
+    except Exception as e:
+        check("%s (unexpected %s: %s)" % (label, type(e).__name__, e), False)
+        return None
+    check(label, pred(result))
+    return result
+
+
 def raises(label, exc_type, fn):
     try:
         fn()
@@ -373,16 +391,102 @@ except AD.AcceleratorProbeError as e:
     check("malformed error names the probe and status",
           e.backend == "xpu" and e.status == AD.STATUS_MALFORMED)
 
-# A fault must win over absence. Without ordering, a machine whose only accelerator probe
-# throws would be reported as having none, sending the reader to the wrong problem.
+# A fault must not be REPORTED AS absence. Narrowed deliberately: an earlier version of this
+# assertion implied every backend is scanned for faults before anything is selected, which is
+# the defect fixed in 12b. See .planning/root-cause/test_accel.py.md.
 t = Ns(cuda=ForbiddenCuda(), xpu=Exploding(), backends=Ns(mps=Ns(is_available=lambda: False)))
 try:
     AD.startup_accelerator(t)
-    check("fault beats absence in reporting order", False)
+    check("a broken probe is not reported as an absent accelerator", False)
 except AD.AcceleratorProbeError:
-    check("fault beats absence in reporting order", True)
+    check("a broken probe is not reported as an absent accelerator", True)
 except AD.NoAcceleratorError:
-    check("fault beats absence in reporting order (got NoAcceleratorError instead)", False)
+    check("a broken probe is not reported as absent (got NoAcceleratorError)", False)
+
+print("\n--- 12b. PRECEDENCE WALK: a fault only matters if it OUTRANKS the selection ---")
+# Transcribed from the reviewer's required algorithm BEFORE the module was changed. Three of
+# these failed against the previous implementation, which is the point: a new test that cannot
+# fail against current code is not testing the requirement.
+#
+# The defect: require_backend() scanned every backend for faults before selecting anything, so
+# a healthy CUDA box shipping a broken torch.xpu was refused startup by a backend it would
+# never have used.
+
+
+def _mps(available=True, bf16=None):
+    m = Ns(is_available=lambda: available)
+    if bf16 is not None:
+        m.is_bf16_supported = lambda: bf16
+    return m
+
+
+def _healthy_cuda(cap=(8, 6)):
+    return Ns(is_available=lambda: True, get_device_capability=lambda device=None: cap)
+
+
+# Positive cases use expect(), so a refusal from a regressed implementation is recorded as a
+# FAIL instead of aborting the run. See the expect() docstring.
+
+# 1. Healthy CUDA plus exploding XPU: CUDA must succeed.
+t = Ns(cuda=_healthy_cuda(), xpu=Exploding(), __version__="x")
+cfg = expect("healthy CUDA + exploding XPU: CUDA selected, not refused",
+             lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "cuda")
+check("  the XPU fault is still preserved as evidence",
+      bool(cfg) and cfg["probe_report"]["xpu"][0] == AD.STATUS_EXCEPTION)
+check("  a faulty backend is NOT counted as a conflict",
+      bool(cfg) and cfg["conflicting_signals"] is False)
+
+# 2. Healthy CUDA plus malformed MPS: CUDA must succeed.
+t = Ns(cuda=_healthy_cuda(), backends=Ns(mps=Ns(is_available=lambda: "sure")), __version__="x")
+cfg = expect("healthy CUDA + malformed MPS: CUDA selected, not refused",
+             lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "cuda")
+check("  the MPS fault is preserved as evidence",
+      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_MALFORMED)
+
+# 3. CUDA unavailable, exploding XPU, healthy MPS: refuse on the XPU fault. Falling through to
+#    MPS would silently demote the machine on the strength of a broken probe.
+t = Ns(cuda=ForbiddenCuda(), xpu=Exploding(), backends=Ns(mps=_mps(True)), __version__="x")
+raises("CUDA off + exploding XPU + healthy MPS: refuses on the XPU fault",
+       AD.AcceleratorProbeError, lambda: AD.startup_accelerator(t, warn=False))
+try:
+    AD.startup_accelerator(t, warn=False)
+except AD.AcceleratorProbeError as e:
+    check("  and it blames XPU, not MPS", e.backend == "xpu")
+
+# 4. CUDA unavailable, healthy XPU, exploding MPS: XPU must succeed.
+t = Ns(cuda=ForbiddenCuda(), xpu=Ns(is_available=lambda: True, is_bf16_supported=lambda: True),
+       backends=Ns(mps=Exploding()), __version__="x")
+cfg = expect("CUDA off + healthy XPU + exploding MPS: XPU selected",
+             lambda: AD.startup_accelerator(t, warn=False), lambda c: c["backend"] == "xpu")
+check("  a lower-priority MPS fault does not invalidate the selection",
+      bool(cfg) and cfg["probe_report"]["mps"][0] == AD.STATUS_EXCEPTION)
+
+# 5. CUDA exception plus healthy XPU: refuse on the CUDA fault. A higher-priority fault must
+#    never be bypassed in favour of a lower-priority backend.
+t = Ns(cuda=Exploding(), xpu=Ns(is_available=lambda: True), __version__="x")
+raises("exploding CUDA + healthy XPU: refuses on the CUDA fault", AD.AcceleratorProbeError,
+       lambda: AD.startup_accelerator(t, warn=False))
+try:
+    AD.startup_accelerator(t, warn=False)
+except AD.AcceleratorProbeError as e:
+    check("  and it blames CUDA, the higher-priority backend", e.backend == "cuda")
+
+# 6. Multiple cleanly available backends, strict conflict off and on.
+t = Ns(cuda=_healthy_cuda(cap=(8, 9)),
+       xpu=Ns(is_available=lambda: True, is_bf16_supported=lambda: True),
+       backends=Ns(mps=_mps(True)), __version__="x")
+cfg = AD.startup_accelerator(t, warn=False)
+check("three cleanly available: CUDA wins, conflict flagged",
+      cfg["backend"] == "cuda" and cfg["conflicting_signals"] is True)
+check("  all three listed as available", cfg["available_backends"] == ["cuda", "xpu", "mps"])
+raises("three cleanly available + strict_conflict: refuses", AD.ConflictingBackendsError,
+       lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False))
+
+# A faulty backend must not be able to manufacture a conflict refusal either.
+t = Ns(cuda=_healthy_cuda(), xpu=Exploding(), __version__="x")
+expect("strict_conflict does NOT refuse when the other backend is broken, not available",
+       lambda: AD.startup_accelerator(t, strict_conflict=True, warn=False),
+       lambda c: c["backend"] == "cuda")
 
 print("\n--- 13. STARTUP ACCEPTS what it should, and stays quiet about CUDA ---")
 cfg = AD.startup_accelerator(cuda_torch(cap=(8, 6)), warn=False)
